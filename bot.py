@@ -1,0 +1,1331 @@
+"""
+Telegram Bot for Property Data Collection
+Powered by Google Gemini AI
+"""
+
+import os
+import logging
+from typing import Dict, Any
+from telegram import (
+    Update, 
+    ReplyKeyboardMarkup, 
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    CallbackQuery
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
+from dotenv import load_dotenv
+from PIL import Image
+import io
+
+# Import our modules
+from database import (
+    init_db,
+    get_or_create_user,
+    create_property,
+    get_user_properties,
+    get_property_stats,
+    add_property_image,
+    search_properties,
+    search_properties_advanced,
+    delete_property,
+    get_property_by_id,
+    get_unique_cities,
+    get_unique_districts,
+    get_properties_by_location,
+)
+from ai_processor import (
+    extract_property_info, 
+    generate_property_summary,
+    parse_search_query,
+    QuotaExceededError
+)
+
+# Helper to format property detail
+def format_property_detail(prop: Any) -> str:
+    """Format property detail for display"""
+    # Price
+    if prop.price:
+        if prop.price >= 1_000_000_000:
+            price_str = f"Rp {prop.price / 1_000_000_000:.1f} Miliar"
+        elif prop.price >= 1_000_000:
+            price_str = f"Rp {prop.price / 1_000_000:.0f} Juta"
+        else:
+            price_str = f"Rp {prop.price:,}"
+    else:
+        price_str = "Hubungi Admin"
+
+    if prop.transaction_type == 'jual sewa' and prop.rent_price:
+        if prop.rent_price >= 1_000_000_000:
+            rent_str = f"Rp {prop.rent_price / 1_000_000_000:.1f} Miliar"
+        elif prop.rent_price >= 1_000_000:
+            rent_str = f"Rp {prop.rent_price / 1_000_000:.0f} Juta"
+        else:
+            rent_str = f"Rp {prop.rent_price:,}"
+        price_str += f" | Sewa: {rent_str}"
+
+    if prop.negotiable:
+        price_str += " (Nego)"
+
+    # Status icon
+    status_icon = "🟢" if prop.status == 'active' else "🔴"
+    
+    # Header
+    detail = f"{status_icon} *{prop.property_type.upper()} {prop.transaction_type.upper()}*\n"
+    if prop.condition:
+        detail += f"_{prop.condition}_\n"
+    detail += f"\n💰 *{price_str}*\n"
+    
+    # Location
+    loc_parts = []
+    if prop.address: loc_parts.append(prop.address)
+    if prop.district: loc_parts.append(prop.district)
+    if prop.city: loc_parts.append(prop.city)
+    detail += f"📍 {', '.join(loc_parts)}\n\n"
+    
+    # Specs
+    detail += "📐 *Spesifikasi:*\n"
+    if prop.land_area: detail += f"• LT: {prop.land_area} m²\n"
+    if prop.building_area: detail += f"• LB: {prop.building_area} m²\n"
+    if prop.bedrooms: detail += f"• KT: {prop.bedrooms}\n"
+    if prop.bathrooms: detail += f"• KM: {prop.bathrooms}\n"
+    if prop.floors: detail += f"• Lantai: {prop.floors}\n"
+    if prop.dimensions: detail += f"• Dimensi: {prop.dimensions}\n"
+    if prop.orientation: detail += f"• Hadap: {prop.orientation}\n"
+    if prop.row_road: detail += f"• Row Jalan: {prop.row_road}\n"
+    
+    # Utilities
+    detail += "\n🔌 *Utilitas:*\n"
+    if prop.electricity: detail += f"• Listrik: {prop.electricity} Watt\n"
+    if prop.water_type: detail += f"• Air: {prop.water_type}\n"
+    if prop.phone_line_count: detail += f"• Telp: {prop.phone_line_count} Line\n"
+    if prop.furnished: detail += f"• Furnished: {prop.furnished}\n"
+    
+    # Legal
+    legal = []
+    if prop.certificate_type: legal.append(prop.certificate_type)
+    if prop.imb: legal.append("IMB ✅")
+    if prop.blueprint: legal.append("Blueprint ✅")
+    if prop.kpr: legal.append("Bisa KPR ✅")
+    
+    if legal:
+        detail += f"\n📄 *Legalitas:* {', '.join(legal)}\n"
+        
+    # Description
+    if prop.description:
+        detail += f"\n📝 *Deskripsi:*\n{prop.description}\n"
+        
+    # Links
+    links = []
+    if prop.property_url: links.append(f"[🔗 Web]({prop.property_url})")
+    if prop.video_review_url: links.append(f"[🎥 Video]({prop.video_review_url})")
+    if prop.agent_url: links.append(f"[👤 Agen]({prop.agent_url})")
+    
+    if links:
+        detail += "\n" + " | ".join(links) + "\n"
+        
+    # Footer ID
+    detail += f"\n_ID: {prop.id} | Updated: {prop.updated_at.strftime('%d/%m/%Y')}_"
+    
+    return detail
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states
+COLLECTING_INFO, CONFIRM_DATA, ADDING_PHOTOS, EDIT_VALUE = range(4)
+FILTER_CITY, FILTER_DISTRICT, FILTER_PRICE = range(10, 13)
+
+# Temporary storage for property data during conversation
+user_property_data: Dict[int, Dict[str, Any]] = {}
+
+def generate_verification_message(data: Dict[str, Any]) -> str:
+    """Generate a detailed list view for verification"""
+    text = "📋 *Verifikasi Data Property*\n"
+    text += "Silakan periksa detail berikut (klik tombol Edit di bawah jika ada yang salah):\n"
+    
+    # helper for value check
+    def v(key, suffix=""):
+        val = data.get(key)
+        # Handle boolean/None explicitly
+        if val is None: return "-"
+        if isinstance(val, bool): return "Ya" if val else "Tidak"
+        return f"{val}{suffix}"
+
+    # Basic Info
+    text += f"\n🏠 *Info Utama*\n"
+    text += f"• Tipe: {v('property_type').capitalize()} ({v('transaction_type').capitalize()})\n"
+    text += f"• Kondisi: {v('condition')}\n"
+    
+    # Financial
+    text += f"\n💰 *Harga*\n"
+    if data.get('price'): 
+        text += f"• Jual: Rp {data['price']:,}\n"
+    if data.get('rent_price'):
+        text += f"• Sewa: Rp {data['rent_price']:,}\n"
+    text += f"• Nego: {v('negotiable')}\n"
+        
+    # Specs
+    text += f"\n📐 *Spesifikasi*\n"
+    text += f"• LT: {v('land_area', ' m²')}\n"
+    text += f"• LB: {v('building_area', ' m²')}\n"
+    text += f"• KT: {v('bedrooms')}\n"
+    text += f"• KM: {v('bathrooms')}\n" 
+    text += f"• Lantai: {v('floors')}\n"
+    text += f"• Listrik: {v('electricity', ' Watt')}\n"
+    text += f"• Air: {v('water_type')}\n"
+    text += f"• Hadap: {v('orientation')}\n"
+    text += f"• Dimensi: {v('dimensions')}\n"
+    text += f"• Furnished: {v('furnished')}\n"
+    text += f"• Jalan: {v('row_road')}\n"
+    
+    # Location
+    text += f"\n📍 *Lokasi*\n"
+    text += f"• Alamat: {v('address')}\n"
+    text += f"• Kecamatan: {v('district')}\n"
+    text += f"• Kota: {v('city')}\n"
+    
+    # Legal
+    text += f"\n📜 *Legalitas*\n"
+    text += f"• Sertifikat: {v('certificate_type')}\n"
+    legal_extras = []
+    if data.get('imb'): legal_extras.append("IMB")
+    if data.get('blueprint'): legal_extras.append("Blueprint")
+    if data.get('kpr'): legal_extras.append("Bisa KPR")
+    if legal_extras:
+        text += f"• Dokumen: {', '.join(legal_extras)}\n"
+    
+    # Facilities
+    if data.get('facilities'):
+        text += f"\n✨ *Fasilitas*: {', '.join(data['facilities'])}\n"
+    
+    # Contact Info
+    if data.get('contact_name') or data.get('contact_phone'):
+        text += f"\n📞 *Kontak*\n"
+        if data.get('contact_name'):
+            text += f"• Nama: {data['contact_name']}\n"
+        if data.get('contact_phone'):
+            text += f"• Telepon: {data['contact_phone']}\n"
+    
+    # Description
+    if data.get('description'):
+        text += f"\n📝 *Deskripsi*: {data['description']}\n"
+        
+    return text
+
+
+def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Get the main menu keyboard"""
+    keyboard = [
+        ['➕ Tambah Properti', '📋 List Properti'],
+        ['🔍 Cari Properti', '📍 Filter Lokasi'],
+        ['📊 Statistik', '❓ Bantuan']
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message when /start is issued"""
+    user = update.effective_user
+    
+    # Create or update user in database
+    get_or_create_user(
+        telegram_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    
+    welcome_text = f"""
+👋 *Halo, {user.first_name}!*
+
+Selamat datang di *Property Bot*. Saya siap membantu Anda mengelola data properti dengan bantuan AI.
+
+Apa yang ingin Anda lakukan? Silakan pilih menu di bawah ini. 👇
+"""
+    await update.message.reply_text(
+        welcome_text, 
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send help message"""
+    help_text = """
+🤖 *Bantuan Property Bot*
+
+Pilih menu di keyboard bawah atau gunakan perintah berikut:
+
+*1. Kelola Properti*
+• ➕ *Tambah*: Menambahkan properti baru (bisa pakai voice/text biasa)
+• 📋 *List*: Melihat daftar properti Anda
+• 📊 *Stats*: Melihat ringkasan jumlah properti
+
+*2. Pencarian*
+• 🔍 *Cari*: Mencari properti (bisa pakai bahasa natural)
+  Contoh: _"Rumah di Jaksel harga 2M"_
+
+*3. Lainnya*
+• /cancel - Membatalkan proses yang sedang berjalan
+• /start - Menampilkan menu utama
+    """
+    
+    await update.message.reply_text(
+        help_text, 
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
+    )
+
+
+async def add_property_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start property addition conversation"""
+    user_id = update.effective_user.id
+    user_property_data[user_id] = {}
+    
+    message = """
+🏠 *Tambah Properti Baru*
+
+Silakan ceritakan detail properti Anda secara natural. Saya akan mengekstrak informasi yang dibutuhkan.
+
+*Contoh:*
+_"Rumah 2 lantai di Menteng Jakarta Pusat, 4 kamar tidur, 3 kamar mandi, luas tanah 200m², luas bangunan 300m², harga 5 miliar nego, sertifikat SHM, ada kolam renang dan taman"_
+
+Ketik /cancel untuk membatalkan.
+"""
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+    return COLLECTING_INFO
+
+
+async def send_verification_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Helper to send/update verification view with edit buttons"""
+    user_id = update.effective_user.id
+    data = user_property_data.get(user_id, {})
+    
+    # Generate verbose checklist
+    message = generate_verification_message(data)
+    message += "\n👇 *Menu Aksi:*"
+    
+    # Inline Keyboard for edits
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 Edit Harga", callback_data="edit_price"),
+            InlineKeyboardButton("📍 Edit Lokasi", callback_data="edit_address")
+        ],
+        [
+            InlineKeyboardButton("📐 Edit LT", callback_data="edit_land_area"),
+            InlineKeyboardButton("🏗️ Edit LB", callback_data="edit_building_area")
+        ],
+        [
+            InlineKeyboardButton("🛏️ Edit KT", callback_data="edit_bedrooms"),
+            InlineKeyboardButton("🚿 Edit KM", callback_data="edit_bathrooms")
+        ],
+        [
+            InlineKeyboardButton("📝 Edit Deskripsi", callback_data="edit_description"),
+            InlineKeyboardButton("✨ Edit Fasilitas", callback_data="edit_facilities")
+        ],
+        [
+            InlineKeyboardButton("❌ Batal", callback_data="cancel_add"),
+            InlineKeyboardButton("✅ SIMPAN DATA", callback_data="save_property")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message, 
+            parse_mode='Markdown', 
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            message, 
+            parse_mode='Markdown', 
+            reply_markup=reply_markup
+        )
+
+async def collect_property_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Collect and extract property information using AI"""
+    user_id = update.effective_user.id
+    user_input = update.message.text
+    
+    status_msg = await update.message.reply_text("🤔 Memproses informasi dengan AI...")
+    
+    try:
+        # Extract property data using Gemini AI
+        extracted_data = extract_property_info(user_input)
+        # Delete processing message
+        await status_msg.delete()
+        
+    except QuotaExceededError:
+        await status_msg.edit_text(
+            "⚠️ *Limit Kuota AI Harian Tercapai*\n\n"
+            "Mohon maaf, layanan AI sedang sibuk. Silakan tunggu sekitar 15-30 menit.\n"
+            "Atau hubungi admin untuk upgrade layanan. 🙏",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    
+    if not extracted_data or 'property_type' not in extracted_data:
+        await update.message.reply_text(
+            "Maaf, saya belum bisa mengenali jenis properti dari deskripsi Anda. "
+            "Mohon sebutkan jenis properti (rumah/apartemen/tanah/ruko/villa) dan coba lagi."
+        )
+        return COLLECTING_INFO
+    
+    # Store extracted data
+    user_property_data[user_id] = extracted_data
+    
+    # Send verification view
+    await send_verification_view(update, context)
+    
+    return CONFIRM_DATA
+
+
+async def handle_confirmation_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle button clicks in verification view"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    action = query.data
+    
+    if action == "save_property":
+        # Save to DB logic
+        user = get_or_create_user(
+            telegram_id=user_id,
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name
+        )
+        
+        try:
+            property_data = user_property_data.get(user_id, {})
+            property_obj = create_property(user.id, property_data)
+            
+            # Store property_id in context
+            context.user_data['current_property_id'] = property_obj.id
+            
+            # Clear temp data
+            user_property_data.pop(user_id, None)
+            
+            keyboard = [['📸 Tambah Foto', '✅ Selesai']]
+            reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            
+            await query.message.reply_text( # Send new message for next step
+                f"✅ *Properti berhasil disimpan!* (ID: {property_obj.id})\n\n"
+                "Apakah Anda ingin menambahkan foto properti?",
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            # Delete the verification message to clean up
+            await query.message.delete()
+            
+            return ADDING_PHOTOS
+            
+        except Exception as e:
+            logger.error(f"Error saving property: {e}")
+            await query.edit_message_text("❌ Maaf, terjadi kesalahan saat menyimpan properti.")
+            return ConversationHandler.END
+
+    elif action == "cancel_add":
+        user_property_data.pop(user_id, None)
+        context.user_data.pop('editing_field', None)
+        
+        # Delete the verification message
+        await query.message.delete()
+        
+        # Send new message with main menu
+        await query.message.reply_text(
+            "❌ Penambahan properti dibatalkan. Kembali ke menu utama.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return ConversationHandler.END
+        
+    elif action.startswith("edit_"):
+        # Handle Edit Request
+        field = action.replace("edit_", "")
+        context.user_data['editing_field'] = field
+        
+        field_names = {
+            'price': 'Harga Jual (angka)',
+            'address': 'Alamat Lengkap',
+            'land_area': 'Luas Tanah (angka m²)',
+            'building_area': 'Luas Bangunan (angka m²)',
+            'bedrooms': 'Jumlah Kamar Tidur',
+            'bathrooms': 'Jumlah Kamar Mandi',
+            'description': 'Deskripsi Properti',
+            'facilities': 'Fasilitas (pisahkan koma)'
+        }
+        
+        field_label = field_names.get(field, field)
+        
+        await query.edit_message_text(
+            f"✏️ *Edit {field_label}*\n\n"
+            f"Silakan ketik nilai baru untuk field ini:",
+            parse_mode='Markdown'
+        )
+        return EDIT_VALUE
+
+    return CONFIRM_DATA
+
+
+async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process the new value for the edited field"""
+    user_id = update.effective_user.id
+    new_value = update.message.text
+    field = context.user_data.get('editing_field')
+    
+    if not field:
+        # Should not happen, but recover
+        await send_verification_view(update, context)
+        return CONFIRM_DATA
+        
+    data = user_property_data.get(user_id, {})
+    
+    # Simple parsing logic
+    try:
+        # Numeric fields
+        if field in ['price', 'rent_price', 'electricity', 'land_area', 'building_area', 
+                    'bedrooms', 'bathrooms', 'floors', 'carports', 'garages']:
+            
+            # Clean non-numeric except dot/comma
+            clean_val = new_value.lower().replace('.', '').replace(',', '')
+            
+            # Simple helpers for M/Jt
+            multiplier = 1
+            if 'm' in clean_val or 'miliar' in clean_val:
+                multiplier = 1_000_000_000
+                clean_val = clean_val.replace('miliar', '').replace('m', '')
+            elif 'jt' in clean_val or 'juta' in clean_val:
+                multiplier = 1_000_000
+                clean_val = clean_val.replace('juta', '').replace('jt', '')
+            
+            # Remove remaining non-digits
+            import re
+            digits = re.search(r'\d+', clean_val)
+            if digits:
+                num_val = int(digits.group()) * multiplier
+                data[field] = num_val
+            else:
+                await update.message.reply_text("❌ Input harus berupa angka. Silakan coba lagi.")
+                return EDIT_VALUE
+
+        elif field == 'facilities':
+            # Split by comma
+            data[field] = [f.strip() for f in new_value.split(',')]
+            
+        else:
+            # Text fields
+            data[field] = new_value
+            
+        # Update successful
+        await update.message.reply_text(f"✅ {field} berhasil diupdate!")
+        
+        # Show verification view again
+        await send_verification_view(update, context)
+        return CONFIRM_DATA
+        
+    except Exception as e:
+        logger.error(f"Error editing value: {e}")
+        await update.message.reply_text("❌ Terjadi kesalahan format. Silakan coba lagi.")
+        return EDIT_VALUE
+
+
+async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle photo upload for property with auto-compression to 100KB max"""
+    property_id = context.user_data.get('current_property_id')
+    
+    # Check if user wants to finish (handle both text and command)
+    message_text = update.message.text if update.message.text else ""
+    if message_text in ['✅ Selesai', '/done'] or update.message.text == '/done':
+        context.user_data.pop('current_property_id', None)
+        await update.message.reply_text(
+            "✅ Properti berhasil ditambahkan!\n\n"
+            "Gunakan /list untuk melihat properti Anda atau /add untuk menambah properti baru.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return ConversationHandler.END
+    
+    if update.message.photo:
+        # Get the largest photo
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        caption = update.message.caption or ""
+        
+        try:
+            # Download original photo
+            file = await context.bot.get_file(file_id)
+            image_bytes = await file.download_as_bytearray()
+            
+            # Compress image to max 100KB
+            compressed_bytes = compress_image(image_bytes, target_size_kb=100)
+            
+            # Upload compressed image back to Telegram
+            compressed_file = io.BytesIO(compressed_bytes)
+            compressed_file.name = 'compressed_image.jpg'
+            
+            # Send compressed photo and get new file_id
+            sent_message = await update.message.reply_photo(
+                photo=compressed_file,
+                caption=f"📸 Foto terkompresi ({len(compressed_bytes)//1024}KB)"
+            )
+            
+            # Save compressed photo file_id to database
+            compressed_file_id = sent_message.photo[-1].file_id
+            add_property_image(property_id, compressed_file_id, caption)
+            
+            await update.message.reply_text(
+                "✅ Foto berhasil ditambahkan dan dikompresi!\n\n"
+                "Kirim foto lagi atau ketik /done untuk selesai."
+            )
+        except Exception as e:
+            logger.error(f"Error saving photo: {e}")
+            await update.message.reply_text("❌ Gagal menyimpan foto. Silakan coba lagi.")
+        
+        return ADDING_PHOTOS
+    else:
+        await update.message.reply_text("Silakan kirim foto atau ketik /done untuk selesai.")
+        return ADDING_PHOTOS
+
+
+def compress_image(image_bytes: bytes, target_size_kb: int = 100, max_dimension: int = 1920) -> bytes:
+    """Compress image to target size while maintaining quality"""
+    # Load image
+    img = Image.open(io.BytesIO(image_bytes))
+    
+    # Convert RGBA to RGB if needed
+    if img.mode == 'RGBA':
+        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+        rgb_img.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+        img = rgb_img
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    # Resize if too large (maintain aspect ratio)
+    if max(img.size) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    
+    # Compress with quality adjustment
+    quality = 85
+    target_size_bytes = target_size_kb * 1024
+    
+    while quality > 20:
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        size = buffer.tell()
+        
+        if size <= target_size_bytes:
+            return buffer.getvalue()
+        
+        quality -= 5
+    
+    # If still too large, return with minimum quality
+    buffer = io.BytesIO()
+    img.save(buffer, format='JPEG', quality=20, optimize=True)
+    return buffer.getvalue()
+
+
+async def list_properties(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List user's properties with pagination"""
+    # Get database user (not telegram_id!)
+    user = get_or_create_user(
+        telegram_id=update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+        last_name=update.effective_user.last_name
+    )
+    
+    # Get page from callback or default to 1
+    page = 1
+    
+    # Fetch properties using database user.id
+    result = get_user_properties(user.id, page=page, limit=5)
+    
+    if not result['items']:
+        await update.message.reply_text(
+            "📭 Anda belum memiliki properti yang tersimpan.\n\n"
+            "Gunakan /add untuk menambahkan properti baru.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+    
+    await send_property_list(update, context, result, "list")
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search properties by keyword or AI Intent"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 *Pencarian Pintar*\n\n"
+            "Anda bisa mencari dengan kalimat natural, contoh:\n"
+            "• `/search rumah di pondok indah harga 5M`\n"
+            "• `/search apartemen 2 kamar di jaksel`\n"
+            "• `/search tanah luas 500m`", 
+            parse_mode='Markdown'
+        )
+        return
+        
+    query_text = ' '.join(context.args)
+    await update.message.reply_text(f"🔎 Mencari: _{query_text}_ ...", parse_mode='Markdown')
+    
+    try:
+        # Try AI Smart Search first
+        filters = parse_search_query(query_text)
+        
+        if filters:
+            # Use advanced search
+            result = search_properties_advanced(user_id, filters, page=1, limit=5)
+            mode = "search_adv"
+            # Store filters for pagination (need to serialize/store in user_data properly)
+            context.user_data['search_filters'] = filters
+        else:
+            # Fallback to basic keyword search
+            result = search_properties(user_id, query_text, page=1, limit=5)
+            mode = "search"
+            context.user_data['search_keyword'] = query_text
+            
+    except QuotaExceededError:
+        # Fallback to basic search if quota exceeded
+        await update.message.reply_text(
+            "⚠️ *Limit Kuota AI Tercapai*\n"
+            "Mengalihkan ke pencarian kata kunci manual...",
+            parse_mode='Markdown'
+        )
+        result = search_properties(user_id, query_text, page=1, limit=5)
+        mode = "search"
+        context.user_data['search_keyword'] = query_text
+
+    if not result['items']:
+        await update.message.reply_text(f"❌ Tidak ditemukan properti yang cocok.")
+        return
+    
+    await send_property_list(update, context, result, mode)
+
+
+async def send_property_list(update: Update, context: ContextTypes.DEFAULT_TYPE, result: Dict[str, Any], mode: str):
+    """Helper to send interactive property list"""
+    items = result['items']
+    page = result['current_page']
+    total_pages = result['total_pages']
+    total_items = result['total_items']
+    
+    title = "🏠 *Daftar Properti Anda*" if mode == "list" else f"🔍 *Hasil Pencarian*"
+    message = f"{title} (Halaman {page}/{total_pages})\nTotal: {total_items} properti\n\n"
+    
+    keyboard = []
+    row_buttons = []
+    
+    for i, prop in enumerate(items, 1):
+        idx = (page - 1) * 5 + i
+        
+        # Format price shorthand
+        price_str = ""
+        if prop.price:
+            if prop.price >= 1_000_000_000:
+                price_str = f"Rp{prop.price / 1_000_000_000:.1f}M"
+            else:
+                price_str = f"Rp{prop.price / 1_000_000:.0f}jt"
+                
+        
+        # Build location display: Address, District, City
+        location_parts = []
+        if prop.address:
+            location_parts.append(prop.address)
+        if prop.district:
+            location_parts.append(prop.district)
+        if prop.city:
+            location_parts.append(prop.city)
+        
+        address_display = ", ".join(location_parts) if location_parts else "?"
+        
+        status_icon = "🟢" if prop.status == 'active' else "🔴"
+        
+        message += f"*{idx}. {prop.property_type.capitalize()} {prop.transaction_type.capitalize()}*\n"
+        message += f"   {status_icon} {address_display} - {price_str}\n"
+        
+        # Add button for this item
+        row_buttons.append(InlineKeyboardButton(f"{idx} 👁️", callback_data=f"detail_{prop.id}"))
+        
+        # Max 2 buttons per row
+        if len(row_buttons) == 2:
+            keyboard.append(row_buttons)
+            row_buttons = []
+            
+    if row_buttons:
+        keyboard.append(row_buttons)
+        
+    # Pagination buttons
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page_{mode}_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{mode}_{page+1}"))
+        
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.message:
+        await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        # Edit message for callback
+        await update.callback_query.edit_message_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle callback queries from inline buttons"""
+    query = update.callback_query
+    telegram_id = query.from_user.id
+    
+    # Get database user for queries
+    user = get_or_create_user(
+        telegram_id=telegram_id,
+        username=query.from_user.username,
+        first_name=query.from_user.first_name,
+        last_name=query.from_user.last_name
+    )
+    
+    await query.answer()
+    
+    data = query.data
+    
+    # 1. Show Detail
+    if data.startswith("detail_"):
+        prop_id = int(data.split("_")[1])
+        prop = get_property_by_id(prop_id)
+        
+        if not prop:
+            await query.edit_message_text("❌ Properti tidak ditemukan atau sudah dihapus.")
+            return
+            
+        text = format_property_detail(prop)
+        
+        # Detail buttons
+        keyboard = [
+            [InlineKeyboardButton("🔙 Kembali", callback_data="back_to_list"), 
+             InlineKeyboardButton("❌ Hapus", callback_data=f"delete_confirm_{prop_id}")]
+        ]
+        
+        # Add external link buttons if exist
+        link_buttons = []
+        if prop.property_url:
+            link_buttons.append(InlineKeyboardButton("🔗 Web", url=prop.property_url))
+        if prop.agent_url:
+            link_buttons.append(InlineKeyboardButton("👤 Agen", url=prop.agent_url))
+        
+        if link_buttons:
+            keyboard.insert(0, link_buttons)
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup, disable_web_page_preview=True)
+
+    # 2. Pagination
+    elif data.startswith("page_"):
+        _, mode, page_num = data.split("_")
+        page = int(page_num)
+        
+        if mode == "search":
+            keyword = context.user_data.get('search_keyword', "")
+            result = search_properties(user.id, keyword, page=page, limit=5)
+        elif mode == "search_adv":
+            filters = context.user_data.get('search_filters', {})
+            result = search_properties_advanced(user.id, filters, page=page, limit=5)
+        elif mode == "filter":
+            city = context.user_data.get('filter_city')
+            district = context.user_data.get('filter_district')
+            min_price = context.user_data.get('filter_min_price')
+            max_price = context.user_data.get('filter_max_price')
+            result = get_properties_by_location(
+                user.id, 
+                city=city, 
+                district=district,
+                min_price=min_price,
+                max_price=max_price,
+                page=page, 
+                limit=5
+            )
+        else:
+            result = get_user_properties(user.id, page=page, limit=5)
+            
+        await send_property_list(update, context, result, mode)
+
+    # 3. Back to list
+    elif data == "back_to_list":
+        # Default back to page 1 list
+        result = get_user_properties(user.id, page=1, limit=5)
+        await send_property_list(update, context, result, "list")
+
+    # 4. Delete Confirmation
+    elif data.startswith("delete_confirm_"):
+        prop_id = int(data.split("_")[2])
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Ya, Hapus", callback_data=f"delete_{prop_id}"),
+             InlineKeyboardButton("❌ Batal", callback_data=f"detail_{prop_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⚠️ *Konfirmasi Penghapusan*\n\nAnda yakin ingin menghapus properti ID: {prop_id}?\nTindakan ini tidak dapat dibatalkan.",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+
+    # 5. Execute Delete
+    elif data.startswith("delete_"):
+        prop_id = int(data.split("_")[1])
+        
+        success = delete_property(prop_id, telegram_id)
+        
+        if success:
+            await query.answer("✅ Properti berhasil dihapus!")
+            # Back to list
+            result = get_user_properties(user.id, page=1, limit=5)
+            await send_property_list(update, context, result, "list")
+        else:
+            await query.edit_message_text("❌ Gagal menghapus properti. Pastikan Anda pemiliknya.")
+            
+
+
+# Filter Handlers
+
+async def start_location_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start location filter - show cities"""
+    user = get_or_create_user(
+        telegram_id=update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+        last_name=update.effective_user.last_name
+    )
+    
+    cities = get_unique_cities(user.id)
+    
+    if not cities:
+        await update.message.reply_text(
+            "📭 Anda belum memiliki properti dengan lokasi.\n\n"
+            "Tambahkan properti terlebih dahulu untuk menggunakan filter.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return ConversationHandler.END
+    
+    # Build inline keyboard with cities
+    keyboard = []
+    for city in cities:
+        keyboard.append([InlineKeyboardButton(city, callback_data=f"filter_city_{city}")])
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data="filter_cancel")])
+    
+    await update.message.reply_text(
+        "🏙️ *Pilih Kota:*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return FILTER_CITY
+
+
+async def handle_filter_city_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle city selection, show districts"""
+    query = update.callback_query
+    await query.answer()
+    
+    city = query.data.replace("filter_city_", "")
+    context.user_data['filter_city'] = city
+    
+    user = get_or_create_user(
+        telegram_id=query.from_user.id,
+        username=query.from_user.username,
+        first_name=query.from_user.first_name,
+        last_name=query.from_user.last_name
+    )
+    
+    districts = get_unique_districts(user.id, city)
+    
+    if not districts:
+        # No districts, show all properties in city
+        result = get_properties_by_location(user.id, city=city, page=1, limit=5)
+        context.user_data['filter_mode'] = 'city'
+        
+        await query.delete_message()
+        await send_property_list_from_query(query, context, result, mode="filter")
+        return ConversationHandler.END
+    
+    # Build inline keyboard with districts
+    keyboard = []
+    for district in districts:
+        keyboard.append([InlineKeyboardButton(district, callback_data=f"filter_dist_{district}")])
+    keyboard.append([InlineKeyboardButton("🔙 Kembali", callback_data="filter_back_city")])
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data="filter_cancel")])
+    
+    await query.edit_message_text(
+        f"📍 *Pilih Kecamatan di {city}:*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return FILTER_DISTRICT
+
+
+async def handle_filter_district_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle district selection, show price range options"""
+    query = update.callback_query
+    await query.answer()
+    
+    district = query.data.replace("filter_dist_", "")
+    city = context.user_data.get('filter_city')
+    context.user_data['filter_district'] = district
+    
+    # Show price range options
+    keyboard = [
+        [InlineKeyboardButton("< 500 Juta", callback_data="filter_price_0-500000000")],
+        [InlineKeyboardButton("500 Juta - 1 Miliar", callback_data="filter_price_500000000-1000000000")],
+        [InlineKeyboardButton("1 - 2 Miliar", callback_data="filter_price_1000000000-2000000000")],
+        [InlineKeyboardButton("2 - 5 Miliar", callback_data="filter_price_2000000000-5000000000")],
+        [InlineKeyboardButton("> 5 Miliar", callback_data="filter_price_5000000000-999999999999")],
+        [InlineKeyboardButton("💰 Tampilkan Semua Harga", callback_data="filter_price_all")],
+        [InlineKeyboardButton("🔙 Kembali", callback_data="filter_back_district"),
+         InlineKeyboardButton("❌ Batal", callback_data="filter_cancel")]
+    ]
+    
+    await query.edit_message_text(
+        f"💰 *Pilih Range Harga*\n\n"
+        f"Filter: {city}, {district}",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return FILTER_PRICE
+
+
+async def handle_filter_price_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle price selection, show filtered list"""
+    query = update.callback_query
+    await query.answer()
+    
+    city = context.user_data.get('filter_city')
+    district = context.user_data.get('filter_district')
+    
+    user = get_or_create_user(
+        telegram_id=query.from_user.id,
+        username=query.from_user.username,
+        first_name=query.from_user.first_name,
+        last_name=query.from_user.last_name
+    )
+    
+    # Parse price range
+    min_price = None
+    max_price = None
+    
+    if query.data != "filter_price_all":
+        price_range = query.data.replace("filter_price_", "")
+        min_price, max_price = map(int, price_range.split("-"))
+    
+    # Get filtered properties
+    result = get_properties_by_location(
+        user.id, 
+        city=city, 
+        district=district,
+        min_price=min_price,
+        max_price=max_price,
+        page=1, 
+        limit=5
+    )
+    
+    # Store filter for pagination
+    context.user_data['filter_mode'] = 'location'
+    context.user_data['filter_city'] = city
+    context.user_data['filter_district'] = district
+    context.user_data['filter_min_price'] = min_price
+    context.user_data['filter_max_price'] = max_price
+    
+    await query.delete_message()
+    await send_property_list_from_query(query, context, result, mode="filter")
+    
+    return ConversationHandler.END
+
+
+async def cancel_location_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel location filter"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "❌ Filter dibatalkan.",
+    )
+    
+    # Send menu in new message
+    await query.message.reply_text(
+        "Kembali ke menu utama.",
+        reply_markup=get_main_menu_keyboard()
+    )
+    
+    return ConversationHandler.END
+
+
+async def send_property_list_from_query(query, context, result, mode):
+    """Helper to send property list after callback query (for filter results)"""
+    items = result['items']
+    page = result['current_page']
+    total_pages = result['total_pages']
+    total_items = result['total_items']
+    
+    # Get filter info for header
+    city = context.user_data.get('filter_city', '')
+    district = context.user_data.get('filter_district', '')
+    filter_location = f"{city}, {district}" if district else city
+    
+    title = f"🔍 *Hasil Filter: {filter_location}*"
+    message = f"{title}\nTotal: {total_items} properti (Halaman {page}/{total_pages})\n\n"
+    
+    keyboard = []
+    row_buttons = []
+    
+    for i, prop in enumerate(items, 1):
+        idx = (page - 1) * 5 + i
+        
+        # Format price shorthand
+        price_str = ""
+        if prop.price:
+            if prop.price >= 1_000_000_000:
+                price_str = f"Rp{prop.price / 1_000_000_000:.1f}M"
+            else:
+                price_str = f"Rp{prop.price / 1_000_000:.0f}jt"
+            
+            # Add price per meter if land_area available
+            if prop.land_area and prop.land_area > 0:
+                price_per_meter = prop.price / prop.land_area
+                if price_per_meter >= 1_000_000:
+                    price_str += f" ({price_per_meter / 1_000_000:.1f}jt/m)"
+                else:
+                    price_str += f" ({price_per_meter / 1_000:.0f}rb/m)"
+        
+        # Only show address (not city/district since it's in header)
+        address_display = prop.address if prop.address else "Alamat tidak tersedia"
+        
+        # Add land area info
+        land_info = ""
+        if prop.land_area:
+            land_info = f" | {prop.land_area}m²"
+        
+        status_icon = "🟢" if prop.status == 'active' else "🔴"
+        
+        message += f"*{idx}. {prop.property_type.capitalize()} {prop.transaction_type.capitalize()}*\n"
+        message += f"   {status_icon} {address_display}{land_info}\n"
+        message += f"   {price_str}\n"
+        
+        # Add button for this item
+        row_buttons.append(InlineKeyboardButton(f"{idx} 👁️", callback_data=f"detail_{prop.id}"))
+        
+        # Max 2 buttons per row
+        if len(row_buttons) == 2:
+            keyboard.append(row_buttons)
+            row_buttons = []
+            
+    if row_buttons:
+        keyboard.append(row_buttons)
+        
+    # Pagination buttons
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page_{mode}_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{mode}_{page+1}"))
+        
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send as NEW message (don't try to edit)
+    await query.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show property statistics"""
+    user = get_or_create_user(
+        telegram_id=update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name
+    )
+    
+    stats = get_property_stats(user.id)
+    
+    message = "📊 *Statistik Properti Anda*\n\n"
+    message += f"📝 Total Properti: *{stats['total']}*\n"
+    message += f"✅ Aktif: *{stats['active']}*\n"
+    message += f"⏸ Tidak Aktif: *{stats['inactive']}*\n\n"
+    
+    if stats['by_type']:
+        message += "*Berdasarkan Jenis:*\n"
+        for prop_type, count in stats['by_type'].items():
+            message += f"  • {prop_type.capitalize()}: {count}\n"
+        message += "\n"
+    
+    if stats['by_transaction']:
+        message += "*Berdasarkan Transaksi:*\n"
+        for trans_type, count in stats['by_transaction'].items():
+            message += f"  • {trans_type.capitalize()}: {count}\n"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel current conversation"""
+    user_id = update.effective_user.id
+    user_property_data.pop(user_id, None)
+    context.user_data.pop('current_property_id', None)
+    context.user_data.pop('editing_field', None)
+    
+    await update.message.reply_text(
+        "❌ Operasi dibatalkan. Kembali ke menu utama.",
+        reply_markup=get_main_menu_keyboard()
+    )
+    return ConversationHandler.END
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle general messages (natural language & menu buttons)"""
+    text = update.message.text
+    
+    # Handle Menu Buttons (non-conversation ones only)
+    # Note: '➕ Tambah Properti' is handled by ConversationHandler entry_points
+        
+    if text == '📋 List Properti':
+        return await list_properties(update, context)
+        
+    elif text == '🔍 Cari Properti':
+        await update.message.reply_text(
+            "🔍 *Mode Pencarian*\n\n"
+            "Silakan ketik apa yang Anda cari. Contoh:\n"
+            "• _Rumah di Bintaro 3 kamar tidur_\n"
+            "• _Tanah di Bogor luas 1000m_\n"
+            "• _Apartemen Jaksel sewa murah_",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
+        return
+
+    elif text == '📊 Statistik':
+        return await show_stats(update, context)
+        
+    elif text == '❓ Bantuan':
+        return await help_command(update, context)
+    
+    elif text == '📍 Filter Lokasi':
+        # Trigger filter conversation
+        return await start_location_filter(update, context)
+
+    # Removed auto-search detection to prevent conflicts with add property flow
+
+    # Default unknown message
+    await update.message.reply_text(
+        "Maaf, saya tidak mengerti. Silakan gunakan tombol menu di bawah. 👇",
+        reply_markup=get_main_menu_keyboard()
+    )
+
+
+def main():
+    """Start the bot"""
+    # Get bot token
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+        return
+    
+    # Initialize database
+    logger.info("Initializing database...")
+    init_db()
+    
+    # Create application
+    application = Application.builder().token(token).build()
+    
+    # Add conversation handler for adding properties
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('add', add_property_start),
+            MessageHandler(filters.Regex('^➕ Tambah Properti$'), add_property_start)
+        ],
+        states={
+            COLLECTING_INFO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, collect_property_info)
+            ],
+            CONFIRM_DATA: [
+                CallbackQueryHandler(handle_confirmation_action)
+            ],
+            EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_value)
+            ],
+            ADDING_PHOTOS: [
+                MessageHandler(
+                    filters.PHOTO | filters.TEXT,
+                    handle_photo_upload
+                )
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    application.add_handler(conv_handler)
+    
+    # Add location filter conversation handler
+    filter_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex('^📍 Filter Lokasi$'), start_location_filter)
+        ],
+        states={
+            FILTER_CITY: [
+                CallbackQueryHandler(handle_filter_city_selection, pattern='^filter_city_')
+            ],
+            FILTER_DISTRICT: [
+                CallbackQueryHandler(handle_filter_district_selection, pattern='^filter_dist_'),
+                CallbackQueryHandler(start_location_filter, pattern='^filter_back_city$')
+            ],
+            FILTER_PRICE: [
+                CallbackQueryHandler(handle_filter_price_selection, pattern='^filter_price_'),
+                CallbackQueryHandler(handle_filter_city_selection, pattern='^filter_back_district$')
+            ]
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_location_filter, pattern='^filter_cancel$')
+        ],
+    )
+    
+    application.add_handler(filter_handler)
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("list", list_properties))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("stats", show_stats))
+    
+    # Add callback query handler
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Add message handler for general messages
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start the bot
+    logger.info("Bot started successfully! Press Ctrl+C to stop.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()

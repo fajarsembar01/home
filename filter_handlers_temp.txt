@@ -1,0 +1,132 @@
+# Filter Handlers - Add before show_stats function
+
+async def start_location_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start location filter - show cities"""
+    user = get_or_create_user(
+        telegram_id=update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+        last_name=update.effective_user.last_name
+    )
+    
+    cities = get_unique_cities(user.id)
+    
+    if not cities:
+        await update.message.reply_text(
+            "📭 Anda belum memiliki properti dengan lokasi.\n\n"
+            "Tambahkan properti terlebih dahulu untuk menggunakan filter.",
+            reply_markup=get_main_menu_keyboard()
+        )
+        return ConversationHandler.END
+    
+    # Build inline keyboard with cities
+    keyboard = []
+    for city in cities:
+        keyboard.append([InlineKeyboardButton(city, callback_data=f"filter_city_{city}")])
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data="filter_cancel")])
+    
+    await update.message.reply_text(
+        "🏙️ *Pilih Kota:*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return FILTER_CITY
+
+
+async def handle_filter_city_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle city selection, show districts"""
+    query = update.callback_query
+    await query.answer()
+    
+    city = query.data.replace("filter_city_", "")
+    context.user_data['filter_city'] = city
+    
+    user = get_or_create_user(
+        telegram_id=query.from_user.id,
+        username=query.from_user.username,
+        first_name=query.from_user.first_name,
+        last_name=query.from_user.last_name
+    )
+    
+    districts = get_unique_districts(user.id, city)
+    
+    if not districts:
+        # No districts, show all properties in city
+        result = get_properties_by_location(user.id, city=city, page=1, limit=5)
+        context.user_data['filter_mode'] = 'city'
+        
+        await query.delete_message()
+        await send_property_list_from_query(query, context, result, mode="filter")
+        return ConversationHandler.END
+    
+    # Build inline keyboard with districts
+    keyboard = []
+    for district in districts:
+        keyboard.append([InlineKeyboardButton(district, callback_data=f"filter_dist_{district}")])
+    keyboard.append([InlineKeyboardButton("🔙 Kembali", callback_data="filter_back_city")])
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data="filter_cancel")])
+    
+    await query.edit_message_text(
+        f"📍 *Pilih Kecamatan di {city}:*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return FILTER_DISTRICT
+
+
+async def handle_filter_district_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle district selection, show filtered list"""
+    query = update.callback_query
+    await query.answer()
+    
+    district = query.data.replace("filter_dist_", "")
+    city = context.user_data.get('filter_city')
+    
+    user = get_or_create_user(
+        telegram_id=query.from_user.id,
+        username=query.from_user.username,
+        first_name=query.from_user.first_name,
+        last_name=query.from_user.last_name
+    )
+    
+    result = get_properties_by_location(user.id, city=city, district=district, page=1, limit=5)
+    
+    # Store filter for pagination
+    context.user_data['filter_mode'] = 'location'
+    context.user_data['filter_city'] = city
+    context.user_data['filter_district'] = district
+    
+    await query.delete_message()
+    await send_property_list_from_query(query, context, result, mode="filter")
+    
+    return ConversationHandler.END
+
+
+async def cancel_location_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel location filter"""
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "❌ Filter dibatalkan.",
+    )
+    
+    # Send menu in new message
+    await query.message.reply_text(
+        "Kembali ke menu utama.",
+        reply_markup=get_main_menu_keyboard()
+    )
+    
+    return ConversationHandler.END
+
+
+async def send_property_list_from_query(query, context, result, mode):
+    """Helper to send property list from callback query context"""
+    # Create a fake update object with callback_query
+    class FakeUpdate:
+        def __init__(self, query_obj):
+            self.callback_query = query_obj
+            self.message = None
+    
+    fake_update = FakeUpdate(query)
+    await send_property_list(fake_update, context, result, mode)
